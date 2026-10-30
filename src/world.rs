@@ -10,6 +10,11 @@ const DEFLECT_KEEP: f32 = 0.6; // speed kept when sliding around an obstacle
 const PUSH_THROUGH_KEEP: f32 = 0.8; // speed kept when plowing through something
 const SPLASH: f32 = 0.3; // how much of that momentum kicks the displaced particle back
 
+// A neighbour counts as "downhill" if cos(angle to gravity) exceeds a cutoff
+// drawn at random from this range. 0.707 = 45 degrees, 0.5 = 60 degrees.
+const REPOSE_MIN: f32 = 0.2; // lower = more erosion, flatter and rounder piles
+const REPOSE_MAX: f32 = 0.7; // stays below cos(45) so diagonals always count
+
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub material: Material,
@@ -200,14 +205,14 @@ impl World {
             return;
         }
 
-        // This material's acceleration here.
+        // This material's acceleration here, as a true vector.
         let scale = material.gravity_scale();
         let (gx, gy) = self.field[i];
-        let (ax, ay) = (gx * scale, gy * scale);
+        let g = (gx * scale, gy * scale);
 
         // 1. Accelerate, apply drag, cap the speed.
-        cell.vx = (cell.vx + ax) * DRAG;
-        cell.vy = (cell.vy + ay) * DRAG;
+        cell.vx = (cell.vx + g.0) * DRAG;
+        cell.vy = (cell.vy + g.1) * DRAG;
         let speed = cell.vx.hypot(cell.vy);
         if speed > MAX_SPEED {
             cell.vx *= MAX_SPEED / speed;
@@ -222,19 +227,18 @@ impl World {
         cell.ry -= whole_y;
         self.cells[i] = cell; // write back BEFORE moving anything
 
-        let down = octant(ax, ay);
         let (mx, my) = (whole_x as i32, whole_y as i32);
         if mx == 0 && my == 0 {
-            if ax.hypot(ay) > 0.01 {
-                self.settle(x, y, down);
+            if g.0.hypot(g.1) > 0.01 {
+                self.settle(x, y, g);
             }
         } else {
-            self.travel(x, y, mx, my, down);
+            self.travel(x, y, mx, my, g);
         }
     }
 
     /// 3. Walk the path one cell at a time until blocked.
-    fn travel(&mut self, x: i32, y: i32, mx: i32, my: i32, down: u8) {
+    fn travel(&mut self, x: i32, y: i32, mx: i32, my: i32, g: (f32, f32)) {
         let steps = mx.abs().max(my.abs());
         let (mut cx, mut cy) = (x, y);
         for s in 1..=steps {
@@ -246,23 +250,21 @@ impl World {
                 cx = tx;
                 cy = ty;
             } else {
-                self.collide(cx, cy, dx, dy, down);
+                self.collide(cx, cy, g);
                 return;
             }
         }
     }
 
     /// 4. Blocked while moving: tell the material, then slide or stop.
-    fn collide(&mut self, x: i32, y: i32, dx: i32, dy: i32, down: u8) {
+    fn collide(&mut self, x: i32, y: i32, g: (f32, f32)) {
         let i = self.idx(x, y);
         let speed = self.cells[i].speed();
 
         if self.on_impact(x, y, speed) {
             return; // the particle was transformed
         }
-
-        let toward = octant(dx as f32, dy as f32);
-        if self.get_around(x, y, toward, down, speed) {
+        if self.get_around(x, y, g, speed) {
             return;
         }
 
@@ -276,36 +278,72 @@ impl World {
 
     /// Not moving this frame. If something is underneath, spread out
     /// (piles slump, liquids level). If not, we're just still speeding up.
-    fn settle(&mut self, x: i32, y: i32, down: u8) {
-        let (bx, by) = dir_vec(down, 0);
+    fn settle(&mut self, x: i32, y: i32, g: (f32, f32)) {
+        let (bx, by) = dir_vec(octant(g.0, g.1), 0);
         let mover = self.get(x, y);
         if self.get(x + bx, y + by).density() < mover.density() {
             return;
         }
-        self.get_around(x, y, down, down, 0.0);
+        self.get_around(x, y, g, 0.0);
     }
 
-    /// Try the two diagonals next to the blocked direction, then (for
-    /// liquids and gases) slide sideways relative to gravity.
-    fn get_around(&mut self, x: i32, y: i32, toward: u8, down: u8, speed: f32) -> bool {
-        let side = if self.rand_bool() { 1 } else { -1 };
+    /// Roll downhill if possible, otherwise (liquids and gases) spread sideways.
+    fn get_around(&mut self, x: i32, y: i32, g: (f32, f32), speed: f32) -> bool {
+        self.downhill_step(x, y, g, speed) || self.spread(x, y, g)
+    }
 
-        for turn in [side, -side] {
-            let (dx, dy) = dir_vec(toward, turn);
-            if self.try_step(x, y, dx, dy) {
-                self.set_velocity(x + dx, y + dy, dx as f32, dy as f32, speed * DEFLECT_KEEP);
-                return true;
+    /// Step to the free neighbour that is most "downhill" relative to the
+    /// true gravity vector, as long as it clears a randomised cutoff.
+    fn downhill_step(&mut self, x: i32, y: i32, g: (f32, f32), speed: f32) -> bool {
+        let len = g.0.hypot(g.1);
+        if len < 1e-6 {
+            return false;
+        }
+        let (ux, uy) = (g.0 / len, g.1 / len);
+        let mover = self.get(x, y);
+        let cutoff = REPOSE_MIN + (REPOSE_MAX - REPOSE_MIN) * self.rand_f32();
+
+        let mut best: Option<(i32, i32)> = None;
+        let mut best_score = f32::MIN;
+        for (dx, dy) in DIRS {
+            let dist = ((dx * dx + dy * dy) as f32).sqrt();
+            let dot = (dx as f32 * ux + dy as f32 * uy) / dist; // cos(angle to gravity)
+            if dot < cutoff {
+                continue;
+            }
+            if self.get(x + dx, y + dy).density() >= mover.density() {
+                continue;
+            }
+            let score = dot + self.rand_f32() * 0.1; // jitter breaks ties
+            if score > best_score {
+                best_score = score;
+                best = Some((dx, dy));
             }
         }
 
+        if let Some((dx, dy)) = best {
+            self.try_step(x, y, dx, dy);
+            self.set_velocity(x + dx, y + dy, dx as f32, dy as f32, speed * DEFLECT_KEEP);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Liquids and gases slide sideways, perpendicular to gravity.
+    fn spread(&mut self, x: i32, y: i32, g: (f32, f32)) -> bool {
         let dispersion = self.get(x, y).dispersion();
-        if dispersion > 0 {
-            for turn in [2 * side, -2 * side] {
-                let (dx, dy) = dir_vec(down, turn);
-                if let Some((nx, ny)) = self.slide(x, y, dx, dy, dispersion) {
-                    self.set_velocity(nx, ny, 0.0, 0.0, 0.0);
-                    return true;
-                }
+        let len = g.0.hypot(g.1);
+        if dispersion == 0 || len < 1e-6 {
+            return false;
+        }
+
+        let (tx, ty) = (-g.1 / len, g.0 / len); // tangent: gravity rotated 90 degrees
+        let sign = if self.rand_bool() { 1.0 } else { -1.0 };
+        for dir in [sign, -sign] {
+            if let Some((nx, ny)) = self.slide(x, y, tx * dir, ty * dir, dispersion) {
+                self.set_velocity(nx, ny, 0.0, 0.0, 0.0);
+                return true;
             }
         }
         false
@@ -379,11 +417,12 @@ impl World {
     }
 
     /// Slide up to `max` cells while the path is clear. Returns where we ended up.
-    fn slide(&mut self, x: i32, y: i32, dx: i32, dy: i32, max: i32) -> Option<(i32, i32)> {
+    fn slide(&mut self, x: i32, y: i32, dx: f32, dy: f32, max: i32) -> Option<(i32, i32)> {
         let mover = self.get(x, y);
         let (mut tx, mut ty) = (x, y);
         for step in 1..=max {
-            let (nx, ny) = (x + dx * step, y + dy * step);
+            let s = step as f32;
+            let (nx, ny) = (x + (dx * s).round() as i32, y + (dy * s).round() as i32);
             if self.get(nx, ny).density() < mover.density() {
                 tx = nx;
                 ty = ny;
@@ -428,4 +467,51 @@ fn scan_order(len: i32, focus: i32, flip: bool) -> Vec<i32> {
     let mut order: Vec<i32> = (0..len).collect();
     order.sort_by_key(|&i| ((i - focus).abs(), if flip { i } else { -i }));
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: i32 = 30;
+
+    fn count(world: &World, material: Material) -> usize {
+        let mut n = 0;
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                if world.get(x, y) == material {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn sand_falls_to_the_floor() {
+        let mut world = World::new(SIZE, SIZE);
+        world.set(5, 0, Material::Sand);
+        for _ in 0..200 {
+            world.step();
+        }
+        assert_eq!(world.get(5, SIZE - 1), Material::Sand);
+        assert_eq!(world.get(5, 0), Material::Empty);
+    }
+
+    #[test]
+    fn sand_is_conserved_and_walls_stay_put() {
+        let mut world = World::new(SIZE, SIZE);
+        for x in 0..SIZE {
+            world.set(x, SIZE - 1, Material::Wall);
+        }
+        world.paint(15, 5, 4, Material::Sand);
+        let sand_before = count(&world, Material::Sand);
+
+        for _ in 0..300 {
+            world.step();
+        }
+
+        assert_eq!(count(&world, Material::Sand), sand_before);
+        assert_eq!(count(&world, Material::Wall), SIZE as usize);
+    }
 }
