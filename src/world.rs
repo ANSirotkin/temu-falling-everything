@@ -2,6 +2,7 @@ use std::f32::consts::TAU;
 
 use crate::gravity::{dir_vec, octant, GravitySource, UniformGravity, DIRS, STANDARD_GRAVITY};
 use crate::material::Material;
+use crate::body::Body;
 
 // Tuning knobs. Everything is in cells and frames.
 const DRAG: f32 = 0.97; // velocity kept each frame (terminal speed ~4.8)
@@ -14,6 +15,10 @@ const SPLASH: f32 = 0.3; // how much of that momentum kicks the displaced partic
 // drawn at random from this range. 0.707 = 45 degrees, 0.5 = 60 degrees.
 const REPOSE_MIN: f32 = 0.2; // lower = more erosion, flatter and rounder piles
 const REPOSE_MAX: f32 = 0.7; // stays below cos(45) so diagonals always count
+
+const BODY_KICK: f32 = 0.8; // how much of the wall's speed displaced liquid inherits
+
+const PUSH_RANGE: i32 = 64; // how far we look along a push for a free cell
 
 #[derive(Clone, Copy)]
 pub struct Cell {
@@ -127,7 +132,12 @@ impl World {
             for dx in -radius..=radius {
                 if dx * dx + dy * dy <= radius * radius {
                     let (x, y) = (cx + dx, cy + dy);
-                    if material == Material::Empty || self.get(x, y) == Material::Empty {
+                                        let (x, y) = (cx + dx, cy + dy);
+                    let here = self.get(x, y);
+                    if here == Material::Vessel {
+                        continue;
+                    }
+                    if material == Material::Empty || here == Material::Empty {
                         self.set(x, y, material);
                     }
                 }
@@ -402,6 +412,15 @@ impl World {
         if target.density() >= mover.density() {
             return false;
         }
+        
+        // Don't squeeze diagonally between two blocked cells.
+        if dx != 0 && dy != 0 {
+            let blocked_a = self.get(x + dx, y).density() >= mover.density();
+            let blocked_b = self.get(x, y + dy).density() >= mover.density();
+            if blocked_a && blocked_b {
+                return false;
+            }
+        }
 
         self.swap_cells(x, y, nx, ny);
 
@@ -460,6 +479,143 @@ impl World {
             pixel.copy_from_slice(&color);
         }
     }
+
+        // ---------- rigid bodies ----------
+
+    /// Is any part of the body overlapping a static wall at this pose?
+    pub fn body_blocked(&self, body: &Body, pos: (f32, f32), angle: f32) -> bool {
+        body.footprint(pos, angle, self.width, self.height)
+            .iter()
+            .any(|&(x, y)| self.get(x, y) == Material::Wall)
+    }
+
+    /// Move a body to a new pose in sub-steps, so no wall cell jumps more
+    /// than about one cell at a time (otherwise liquid could tunnel through).
+    pub fn move_body(&mut self, body: &mut Body, target: (f32, f32), target_angle: f32) {
+        let (dx, dy) = (target.0 - body.pos.0, target.1 - body.pos.1);
+        let dangle = target_angle - body.angle;
+        let (start, start_angle) = (body.pos, body.angle);
+
+        let travel = dx.hypot(dy).max(dangle.abs() * body.shape.radius());
+        let substeps = (travel.ceil() as i32).max(1);
+
+        for s in 1..=substeps {
+            let t = s as f32 / substeps as f32;
+            let pos = (start.0 + dx * t, start.1 + dy * t);
+            let angle = start_angle + dangle * t;
+            self.stamp_body(body, pos, angle, (dx, dy), dangle);
+        }
+    }
+
+    /// Replace the body's old footprint with a new one, pushing aside
+    /// whatever was in the way.
+    fn stamp_body(
+        &mut self,
+        body: &mut Body,
+        pos: (f32, f32),
+        angle: f32,
+        vel: (f32, f32), // cells per frame
+        omega: f32,      // radians per frame
+    ) {
+        // 1. Remove the old footprint.
+        for &(x, y) in &body.cells {
+            let i = self.idx(x, y);
+            if self.cells[i].material == Material::Vessel {
+                self.cells[i] = Cell::EMPTY;
+            }
+        }
+
+        // 2. Stamp the new footprint, collecting whatever was in the way.
+        let footprint = body.footprint(pos, angle, self.width, self.height);
+        let mut stamped = Vec::with_capacity(footprint.len());
+        let mut displaced: Vec<(i32, i32, Cell)> = Vec::new();
+        for (x, y) in footprint {
+            let i = self.idx(x, y);
+            let existing = self.cells[i];
+            match existing.material {
+                Material::Wall | Material::Vessel => continue, // already solid
+                Material::Empty => {}
+                _ => displaced.push((x, y, existing)),
+            }
+            self.cells[i] = Cell::new(Material::Vessel);
+            stamped.push((x, y));
+        }
+        body.cells = stamped;
+        body.pos = pos;
+        body.angle = angle;
+
+        // 3. Re-home displaced particles, moving with the wall that pushed them.
+                // 3. Re-home displaced particles, pushing them along with the wall.
+        for (x, y, mut cell) in displaced {
+            let (rx, ry) = (x as f32 + 0.5 - pos.0, y as f32 + 0.5 - pos.1);
+            // Wall velocity at this point: translation plus rotation about the pivot.
+            let (wvx, wvy) = (vel.0 - omega * ry, vel.1 + omega * rx);
+
+            let spot = self
+                .find_free_along(x, y, (wvx, wvy), PUSH_RANGE)
+                .or_else(|| self.nearest_free(x, y, (wvx, wvy)));
+
+            if let Some((nx, ny)) = spot {
+                cell.vx = (wvx * BODY_KICK).clamp(-MAX_SPEED, MAX_SPEED);
+                cell.vy = (wvy * BODY_KICK).clamp(-MAX_SPEED, MAX_SPEED);
+                cell.rx = 0.0;
+                cell.ry = 0.0;
+                let j = self.idx(nx, ny);
+                self.cells[j] = cell;
+            }
+            // Otherwise it was squeezed out of existence (rare).
+        }
+    }
+
+    /// The closest empty cell, preferring cells in the direction `push`.
+    fn nearest_free(&self, x: i32, y: i32, push: (f32, f32)) -> Option<(i32, i32)> {
+        const RADIUS: i32 = 2;
+        let len = push.0.hypot(push.1);
+        let dir = if len > 0.01 {
+            (push.0 / len, push.1 / len)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let mut best = None;
+        let mut best_score = f32::MAX;
+        for dy in -RADIUS..=RADIUS {
+            for dx in -RADIUS..=RADIUS {
+                if self.get(x + dx, y + dy) != Material::Empty {
+                    continue;
+                }
+                let dist_sq = (dx * dx + dy * dy) as f32;
+                let ahead = dx as f32 * dir.0 + dy as f32 * dir.1;
+                let score = dist_sq - 3.0 * ahead; // closer and further ahead = better
+                if score < best_score {
+                    best_score = score;
+                    best = Some((x + dx, y + dy));
+                }
+            }
+        }
+        best
+    }
+
+        /// Walk from (x, y) in direction `dir` through liquids, powders and gases
+    /// and return the first empty cell. Stops at solids.
+    fn find_free_along(&self, x: i32, y: i32, dir: (f32, f32), max: i32) -> Option<(i32, i32)> {
+        let len = dir.0.hypot(dir.1);
+        if len < 0.01 {
+            return None;
+        }
+        let (ux, uy) = (dir.0 / len, dir.1 / len);
+
+        for step in 1..=max {
+            let s = step as f32;
+            let (nx, ny) = (x + (ux * s).round() as i32, y + (uy * s).round() as i32);
+            match self.get(nx, ny) {
+                Material::Empty => return Some((nx, ny)),
+                Material::Wall | Material::Vessel => return None, // blocked by a solid
+                _ => {} // keep going: these get shifted along
+            }
+        }
+        None
+    }
 }
 
 /// Indices 0..len ordered outward from `focus` (nearest first).
@@ -472,6 +628,7 @@ fn scan_order(len: i32, focus: i32, flip: bool) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::Shape;
 
     const SIZE: i32 = 30;
 
@@ -513,5 +670,47 @@ mod tests {
 
         assert_eq!(count(&world, Material::Sand), sand_before);
         assert_eq!(count(&world, Material::Wall), SIZE as usize);
+    }
+
+    #[test]
+    fn lifting_a_full_cup_keeps_the_water_inside() {
+        let mut world = World::new(80, 100);
+        let mut body = Body::new(Shape::cup(10.0, 10.0, 26, 3.0), (40.0, 80.0));
+        world.move_body(&mut body, (40.0, 80.0), 0.0);
+
+        // Fill the inside of the cup.
+        for y in 75..90 {
+            for x in 33..=46 {
+                if world.get(x, y) == Material::Empty {
+                    world.set(x, y, Material::Water);
+                }
+            }
+        }
+
+        let count_water = |world: &World| {
+            let (mut total, mut outside) = (0, 0);
+            for y in 0..100 {
+                for x in 0..80 {
+                    if world.get(x, y) == Material::Water {
+                        total += 1;
+                        if x < 29 || x > 51 {
+                            outside += 1; // beyond the cup's own width
+                        }
+                    }
+                }
+            }
+            (total, outside)
+        };
+        let (before, _) = count_water(&world);
+
+        for _ in 0..20 {
+            let target = (body.pos.0, body.pos.1 - 1.0);
+            world.move_body(&mut body, target, 0.0);
+            world.step();
+        }
+
+        let (after, outside) = count_water(&world);
+        assert_eq!(after, before, "water was lost");
+        assert_eq!(outside, 0, "water leaked out of the sides");
     }
 }

@@ -8,6 +8,7 @@ pub enum Material {
     Wall,
     Glass,
     Shards,
+    Vessel,
 }
 
 /// What happens to a particle that hits something fast enough.
@@ -23,7 +24,7 @@ pub struct MaterialDef {
     pub id: Material, // must match this row's position (checked by a test)
     pub name: &'static str,
     pub color: [u8; 4],
-    pub density: u8,
+    pub density: u8,    
     pub movable: bool,
     pub gravity_scale: f32, // 1.0 normal, negative = rises, 0.0 = ignores gravity
     pub dispersion: i32,    // how far it spreads sideways at rest
@@ -43,7 +44,7 @@ const DEFAULT: MaterialDef = MaterialDef {
 };
 
 /// One row per material, in the SAME ORDER as the enum.
-static MATERIALS: [MaterialDef; 7] = [
+static MATERIALS: [MaterialDef; 8] = [
     MaterialDef {
         id: Material::Empty,
         name: "Empty",
@@ -102,6 +103,16 @@ static MATERIALS: [MaterialDef; 7] = [
         name: "Shards",
         color: [200, 235, 240, 255],
         density: 4,
+        ..DEFAULT
+    },
+
+    MaterialDef {
+        id: Material::Vessel,
+        name: "Vessel",
+        color: [170, 205, 215, 255],
+        density: 255,
+        movable: false,
+        gravity_scale: 0.0,
         ..DEFAULT
     },
 ];
